@@ -1,0 +1,11 @@
+/target
+/dist
+*.redb
+*.redb-*
+stargaze-*.tar.gz
+stargaze-*.zip
+.env
+.env.local
+Cargo.lock.bak
+criterion/
+*.profraw

@@ -1,0 +1,45 @@
+[package]
+name = "stargaze"
+version = "0.1.0"
+edition = "2021"
+authors = ["bkataru <baalateja.k@gmail.com>"]
+description = "Cache and search your GitHub stars from the terminal"
+repository = "https://github.com/bkataru/stargaze"
+license = "MIT"
+readme = "README.md"
+keywords = ["github", "stars", "cli", "search", "cache"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "stargaze"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stargaze"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+redb = "2.2"
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rayon = "1.10"
+lru = "0.12"
+tiny_http = "0.12"
+
+[dev-dependencies]
+tempfile = "3.13"
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
+[[bench]]
+name = "workloads"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

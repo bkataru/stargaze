@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Unit + integration tests (hermetic)
+        run: cargo test --verbose
+
+      - name: Bench compile check
+        run: cargo bench --no-run
+
+  live:
+    # Live tests run only on the main repo (not forks) and only when
+    # GH_TOKEN is available as a secret. We skip the matrix here to
+    # keep API quota spend to one run per push.
+    runs-on: ubuntu-latest
+    if: github.repository == 'bkataru/stargaze' && github.event_name == 'push'
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Live tests against real GitHub API
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+        run: cargo test -- --ignored
