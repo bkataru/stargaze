@@ -16,6 +16,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use lru::LruCache;
 use rayon::prelude::*;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};

@@ -261,3 +261,57 @@ fn large_corpus_search_completes_quickly() {
         assert_eq!(h.repo.language.as_deref(), Some("Rust"));
     }
 }
+
+// Tests for OR and pipe query operators and boost multipliers
+#[test]
+fn search_OR_syntax_foo_bar() {
+    let idx = RepoIndex::new(corpus());
+    // repos with "foo" or "bar" should be returned
+    let hits = idx.search("foo OR bar", None, None, 100);
+    let names: Vec<&str> = hits.iter().map(|h| h.repo.full_name.as_str()).collect();
+    assert!(names.contains(&"prisma/prisma"));
+    assert!(names.contains(&"facebook/react"));
+    assert!(names.iter().any(|n| n.contains("foo") || n.contains("bar"));
+}
+
+#[test]
+fn search_pipe_syntax_foo_bar() {
+    let idx = RepoIndex::new(corpus());
+    let hits = idx.search("foo | bar", None, None, 100);
+    let names: Vec<&str> = hits.iter().map(|h| h.repo.full_name.as_str()).collect();
+    assert!(names.contains(&"prisma/prisma"));
+    assert!(names.contains(&"facebook/react"));
+    assert!(names.iter().any(|n| n.contains("foo") || n.contains("bar"));
+}
+
+#[test]
+fn search_topic_boost_twice_as_heavy_as_description() {
+    // repo where searching a term matches only topics (+2) so score >= 2.0
+    let repo = r(
+        "z/topicscore",
+        None,
+        1,
+        Some("something"),
+        vec!["topicword"],
+    );
+    let idx = RepoIndex::new(vec![repo]);
+    let hits = idx.search("topicword", None, None, 100);
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].score >= 2.0);
+}
+
+#[test]
+fn search_full_name_boost_one_point_five_times_heavier_than_description() {
+    // repo that matches only on full_name (+3) so score >= 3.0
+    let repo = r(
+        "boostfull/boostthis",
+        None,
+        1,
+        Some("boostthis"),
+        vec![],
+    );
+    let idx = RepoIndex::new(vec![repo]);
+    let hits = idx.search("boostfull", None, None, 100);
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].score >= 3.0);
+}
