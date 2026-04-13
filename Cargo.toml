@@ -30,6 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 lru = "0.12"
 tiny_http = "0.12"
+fuzzy-matcher = "0.3"
 
 [dev-dependencies]
 tempfile = "3.13"
