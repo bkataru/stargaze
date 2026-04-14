@@ -1,14 +1,22 @@
 [package]
 name = "stargaze"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+rust-version = "1.76"
 authors = ["bkataru <baalateja.k@gmail.com>"]
 description = "Cache and search your GitHub stars from the terminal"
 repository = "https://github.com/bkataru/stargaze"
+homepage = "https://crates.io/crates/stargaze"
+documentation = "https://docs.rs/stargaze"
 license = "MIT"
 readme = "README.md"
 keywords = ["github", "stars", "cli", "search", "cache"]
 categories = ["command-line-utilities"]
+exclude = [
+    ".gitignore",
+    ".github/*",
+    "target/*",
+]
 
 [lib]
 name = "stargaze"
