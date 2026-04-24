@@ -1,18 +1,20 @@
-//! stargaze — cache and search your GitHub stars from the terminal.
-//!
-//! All logic lives in this library so it's reachable from `main.rs`, from
-//! integration tests under `tests/`, and from criterion benches under
-//! `benches/`. The binary itself is a thin CLI shell that parses args,
-//! opens the database, and dispatches to the functions exported here.
-//!
-//! Design invariants:
-//!   - Pure Rust only. No C dependencies (no `rusqlite`, no `openssl-sys`).
-//!     Storage is [`redb`] (MPL-2.0), HTTP is [`ureq`] with `rustls`.
-//!   - No async runtime. Blocking HTTP + blocking storage, rayon only for
-//!     CPU-bound parallelism over in-memory slices.
-//!   - No shelling out. Never invokes `gh`, `git`, `curl`, etc.
-//!   - Single static binary. `cargo build --release` produces a relocatable
-//!     artifact with no runtime dependencies beyond libc.
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+// stargaze — cache and search your GitHub stars from the terminal.
+//
+// All logic lives in this library so it's reachable from `main.rs`, from
+// integration tests under `tests/`, and from criterion benches under
+// `benches/`. The binary itself is a thin CLI shell that parses args,
+// opens the database, and dispatches to the functions exported here.
+//
+// Design invariants:
+//   - Pure Rust only. No C dependencies (no `rusqlite`, no `openssl-sys`).
+//     Storage is [`redb`] (MPL-2.0), HTTP is [`ureq`] with `rustls`.
+//   - No async runtime. Blocking HTTP + blocking storage, rayon only for
+//     CPU-bound parallelism over in-memory slices.
+//   - No shelling out. Never invokes `gh`, `git`, `curl`, etc.
+//   - Single static binary. `cargo build --release` produces a relocatable
+//     artifact with no runtime dependencies beyond libc.
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -316,6 +318,9 @@ impl RepoIndex {
         lang: Option<&str>,
         topic: Option<&str>,
         limit: usize,
+        fuzzy: bool,
+        or_mode: bool,
+        topic_boost: bool,
     ) -> Vec<SearchHit<'_>> {
         let q_lc = query.to_lowercase();
         let lang_lc = lang.map(|s| s.to_lowercase());
@@ -340,18 +345,65 @@ impl RepoIndex {
                 .par_iter()
                 .enumerate()
                 .filter_map(|(i, ir)| {
-                    if !ir.matches(&q_lc) {
-                        return None;
-                    }
+                    // Language filter
                     if let Some(ref l) = lang_lc {
                         if ir.language_lc != *l {
                             return None;
                         }
                     }
+                    // Topic filter
                     if let Some(ref t) = topic_owned {
                         if !ir.topics_lower.iter().any(|x| x == t) {
                             return None;
                         }
+                    }
+                    // Query matching
+                    let query_matches = if fuzzy {
+                        // Fuzzy matching
+                        if or_mode {
+                            // OR mode: split query and match any term
+                            let terms: Vec<&str> = q_lc.split_whitespace().collect();
+                            if terms.is_empty() {
+                                true
+                            } else {
+                                let matcher = SkimMatcherV2::default();
+                                terms.iter().any(|term| {
+                                    matcher.fuzzy_match(&ir.full_name_lc, term).is_some() ||
+                                    matcher.fuzzy_match(&ir.description_lc, term).is_some() ||
+                                    ir.topics_lc.split_whitespace().any(|t| matcher.fuzzy_match(t, term).is_some()) ||
+                                    (!ir.readme_lc.is_empty() && matcher.fuzzy_match(&ir.readme_lc, term).is_some())
+                                })
+                            }
+                        } else {
+                            // AND mode with fuzzy matching
+                            let matcher = SkimMatcherV2::default();
+                            matcher.fuzzy_match(&ir.full_name_lc, &q_lc).is_some() ||
+                            matcher.fuzzy_match(&ir.description_lc, &q_lc).is_some() ||
+                            ir.topics_lc.split_whitespace().any(|t| matcher.fuzzy_match(t, &q_lc).is_some()) ||
+                            (!ir.readme_lc.is_empty() && matcher.fuzzy_match(&ir.readme_lc, &q_lc).is_some())
+                        }
+                    } else {
+                        // Exact substring matching
+                        if or_mode {
+                            // OR mode with exact matching
+                            let terms: Vec<&str> = q_lc.split_whitespace().collect();
+                            if terms.is_empty() {
+                                true
+                            } else {
+                                terms.iter().any(|term| {
+                                    ir.full_name_lc.contains(term) ||
+                                    ir.description_lc.contains(term) ||
+                                    ir.topics_lc.contains(term) ||
+                                    (!ir.readme_lc.is_empty() && ir.readme_lc.contains(term))
+                                })
+                            }
+                        } else {
+                            // AND mode (default)
+                            ir.matches(&q_lc)
+                        }
+                    };
+                    if !query_matches {
+                        return None;
                     }
                     Some(i)
                 })
@@ -364,9 +416,31 @@ impl RepoIndex {
 
         let mut hits: Vec<SearchHit<'_>> = matching_indices
             .par_iter()
-            .map(|&i| SearchHit {
-                repo: &self.repos[i].repo,
-                score: self.repos[i].score(&q_lc),
+            .map(|&i| {
+                let mut score = self.repos[i].score(&q_lc);
+                // Apply topic boost if enabled
+                if topic_boost {
+                    if let Some(ref t) = topic_owned {
+                        if self.repos[i].topics_lower.iter().any(|x| x == t) {
+                            score *= 2.0; // Double the score for matching topic
+                        }
+                    }
+                }
+                // Adjust score based on fuzzy match quality if fuzzy enabled
+                if fuzzy {
+                    let matcher = SkimMatcherV2::default();
+                    let fuzzy_score = matcher.fuzzy_match(&self.repos[i].full_name_lc, &q_lc)
+                        .or_else(|| matcher.fuzzy_match(&self.repos[i].description_lc, &q_lc))
+                        .unwrap_or(0);
+                    // Normalize fuzzy score and add to base score
+                    if fuzzy_score > 0 {
+                        score += (fuzzy_score as f64) / 100.0;
+                    }
+                }
+                SearchHit {
+                    repo: &self.repos[i].repo,
+                    score,
+                }
             })
             .collect();
 
@@ -961,7 +1035,7 @@ fn mcp_tools_call(
             let lang = args.get("lang").and_then(|l| l.as_str());
             let topic = args.get("topic").and_then(|t| t.as_str());
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(30) as usize;
-            let hits = index.search(query, lang, topic, limit);
+            let hits = index.search(query, lang, topic, limit, false, false, false);
             Ok(mcp_tool_result_json(&hits_to_json(&hits)))
         }
         "show_star" => {
@@ -1262,7 +1336,7 @@ pub fn route_api(
                 .get("limit")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30);
-            let hits = index.search(query, lang, topic, limit);
+            let hits = index.search(query, lang, topic, limit, false, false, false);
             let total = index.match_count(query, lang, topic);
             ApiResponse::ok(serde_json::json!({
                 "total": total,

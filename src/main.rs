@@ -6,6 +6,8 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
+use redb::Database;
 use std::path::PathBuf;
 
 use stargaze::{
@@ -127,7 +129,7 @@ async fn main() -> Result<()> {
         Some(p) => p,
         None => default_db_path()?,
     };
-    let db = spawn_blocking(move || open_db(&db_path)).await??;
+    let db = Arc::new(open_db(&db_path).expect("failed to open db"));
 
     match cli.cmd {
         Cmd::Sync {
@@ -137,11 +139,11 @@ async fn main() -> Result<()> {
             concurrency,
         } => {
             let token = resolve_token(cli.token)?;
-            cmd_sync(&db, token, user, prune, with_readmes, concurrency)
+            cmd_sync(Arc::clone(&db), token, user, prune, with_readmes, concurrency).await
         }
         Cmd::Readmes { concurrency, force } => {
             let token = resolve_token(cli.token)?;
-            cmd_readmes(&db, token, concurrency, force).await
+            cmd_readmes(Arc::clone(&db), token, concurrency, force).await
         }
         Cmd::Search {
             query,
@@ -151,11 +153,11 @@ async fn main() -> Result<()> {
             fuzzy,
             or_mode,
             topic_boost,
-        } => cmd_search(&db, &query, limit, lang, topic, fuzzy, or_mode, topic_boost).await,
-        Cmd::Show { full_name } => cmd_show(&db, &full_name).await,
-        Cmd::Stats => cmd_stats(&db).await,
-        Cmd::List { limit } => cmd_list(&db, limit).await,
-        Cmd::Serve => spawn_blocking(move || run_mcp_stdio(db)).await??,
+        } => cmd_search(Arc::clone(&db), &query, limit, lang, topic, fuzzy, or_mode, topic_boost).await,
+        Cmd::Show { full_name } => cmd_show(Arc::clone(&db), &full_name).await,
+        Cmd::Stats => cmd_stats(Arc::clone(&db)).await,
+        Cmd::List { limit } => cmd_list(Arc::clone(&db), limit).await,
+        Cmd::Serve => { spawn_blocking(move || run_mcp_stdio(Arc::try_unwrap(db).unwrap_or_else(|_| panic!("Failed to unwrap Arc")))).await?; Ok(()) },
         Cmd::Api {
             bind,
             api_key,
@@ -164,13 +166,13 @@ async fn main() -> Result<()> {
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid --bind {}: {}", bind, e))?;
-            spawn_blocking(move || run_api_server(db, addr, api_key, threads)).await??
+            spawn_blocking(move || run_api_server(Arc::try_unwrap(db).unwrap_or_else(|_| panic!("Failed to unwrap Arc")), addr, api_key, threads)).await?; Ok(())
         }
     }
 }
 
 async fn cmd_sync(
-    db: &redb::Database,
+    db: Arc<Database>,
     token: String,
     user: Option<String>,
     prune: bool,
@@ -202,14 +204,17 @@ async fn cmd_sync(
     }
 
     let repos_clone = repos.clone();
-    let n = spawn_blocking(move || upsert_repos(db, &repos_clone)).await??;
+    let repos_clone2 = repos_clone.clone();
+    let db_clone = Arc::clone(&db);
+    let n = spawn_blocking(move || upsert_repos(&db_clone, &repos_clone2)).await?;
     eprintln!("stargaze: upserted {} repos", n);
 
     if prune {
         let keep: std::collections::HashSet<String> =
             repos.iter().map(|r| r.full_name.clone()).collect();
         let keep_clone = keep.clone();
-        let removed = spawn_blocking(move || retain_repos(db, &keep_clone)).await??;
+        let db_clone = Arc::clone(&db);
+        let removed = spawn_blocking(move || retain_repos(&db_clone, &keep_clone)).await?;
         if removed > 0 {
             eprintln!("stargaze: pruned {} unstarred repos", removed);
         }
@@ -217,11 +222,11 @@ async fn cmd_sync(
     Ok(())
 }
 
-async fn cmd_readmes(db: &redb::Database, token: String, concurrency: usize, force: bool) -> Result<()> {
+async fn cmd_readmes(db: Arc<Database>, token: String, concurrency: usize, force: bool) -> Result<()> {
     let all = spawn_blocking({
         let db = db.clone();
         move || load_all(&db)
-    }).await??;
+    }).await?;
     let targets: Vec<Repo> = if force {
         all
     } else {
@@ -239,8 +244,9 @@ async fn cmd_readmes(db: &redb::Database, token: String, concurrency: usize, for
     let fetched = fetch_readmes_parallel(&token, targets, concurrency).await;
     let upserted = spawn_blocking({
         let db = db.clone();
-        move || upsert_repos(&db, &fetched)
-    }).await??;
+        let fetched_clone = fetched.clone();
+        move || upsert_repos(&db, &fetched_clone)
+    }).await?;
     let hit = fetched.iter().filter(|r| r.readme.is_some()).count();
     eprintln!(
         "stargaze: upserted {} repos ({} with fresh README)",
@@ -250,22 +256,25 @@ async fn cmd_readmes(db: &redb::Database, token: String, concurrency: usize, for
 }
 
 async fn cmd_search(
-    db: &redb::Database,
+    db: Arc<Database>,
     query: &str,
     limit: usize,
     lang: Option<String>,
     topic: Option<String>,
+    fuzzy: bool,
+    or_mode: bool,
+    topic_boost: bool,
 ) -> Result<()> {
     let repos = spawn_blocking({
         let db = db.clone();
         move || load_all(&db)
-    }).await??;
+    }).await?;
     if repos.is_empty() {
         eprintln!("(cache is empty — run `stargaze sync` first)");
         return Ok(());
     }
     let idx = RepoIndex::new(repos);
-    let hits = idx.search(query, lang.as_deref(), topic.as_deref(), limit);
+    let hits = idx.search(query, lang.as_deref(), topic.as_deref(), limit, fuzzy, or_mode, topic_boost);
 
     if hits.is_empty() {
         println!("(no matches for {:?})", query);
@@ -294,12 +303,12 @@ fn print_hit(h: &SearchHit<'_>) {
     );
 }
 
-async fn cmd_show(db: &redb::Database, full_name: &str) -> Result<()> {
+async fn cmd_show(db: Arc<Database>, full_name: &str) -> Result<()> {
     match spawn_blocking({
         let db = db.clone();
         let full_name = full_name.to_string();
         move || load_one(&db, &full_name)
-    }).await?? {
+    }).await? {
         Some(r) => {
             println!("{}", serde_json::to_string_pretty(&r)?);
             Ok(())
@@ -311,19 +320,19 @@ async fn cmd_show(db: &redb::Database, full_name: &str) -> Result<()> {
     }
 }
 
-async fn cmd_stats(db: &redb::Database) -> Result<()> {
+async fn cmd_stats(db: Arc<Database>) -> Result<()> {
     let total = spawn_blocking({
         let db = db.clone();
         move || count_repos(&db)
-    }).await??;
+    }).await?;
     let last_sync = spawn_blocking({
         let db = db.clone();
         move || read_meta(&db, "last_sync")
-    }).await??;
+    }).await?;
     let last_count = spawn_blocking({
         let db = db.clone();
         move || read_meta(&db, "last_sync_count")
-    }).await??;
+    }).await?;
     println!("stargaze stats");
     println!("  cached repos : {}", total);
     println!("  last sync    : {}", last_sync.unwrap_or_else(|| "(never)".into()));
@@ -332,7 +341,7 @@ async fn cmd_stats(db: &redb::Database) -> Result<()> {
     let repos = spawn_blocking({
         let db = db.clone();
         move || load_all(&db)
-    }).await??;
+    }).await?;
     let mut by_lang: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for r in &repos {
         let l = r.language.as_deref().unwrap_or("-");
@@ -347,11 +356,11 @@ async fn cmd_stats(db: &redb::Database) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_list(db: &redb::Database, limit: usize) -> Result<()> {
+async fn cmd_list(db: Arc<Database>, limit: usize) -> Result<()> {
     let mut all = spawn_blocking({
         let db = db.clone();
         move || load_all(&db)
-    }).await??;
+    }).await?;
     all.sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count));
     for r in all.iter().take(limit) {
         let lang = r.language.as_deref().unwrap_or("-");
