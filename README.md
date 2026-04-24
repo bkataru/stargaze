@@ -61,7 +61,7 @@ stargaze serve
 |---|---|
 | `stargaze sync [--user <login>] [--with-readmes] [--concurrency N] [--prune]` | Fetch all starred repos via the GitHub API and upsert into the local cache. `--with-readmes` also pulls each repo's README in parallel. `--prune` removes locally cached repos that are no longer starred. |
 | `stargaze readmes [--force] [--concurrency N]` | Fetch READMEs for already-cached repos. Skips repos with a cached README unless `--force`. Useful after a plain `sync`. |
-| `stargaze search <query> [--lang <L>] [--topic <T>] [--limit N]` | Substring match across `full_name`, `description`, `language`, `topics`, and cached README text. Ranks by weighted hit count × log(stars). Weight order: full_name (+3), description (+2), topics (+2), language (+1), readme (+1). Cold queries run in parallel via rayon; repeat queries hit an LRU cache. |
+| `stargaze search <query> [--lang <L>] [--topic <T>] [--limit N] [--semantic]` | Substring match across `full_name`, `description`, `language`, `topics`, and cached README text. Ranks by weighted hit count × log(stars). Weight order: full_name (+3), description (+2), topics (+2), language (+1), readme (+1). Add `--semantic` to use vector embeddings (fastembed) for semantic similarity. Cold queries run in parallel via rayon; repeat queries hit an LRU cache. |
 | `stargaze show <owner/name>` | Pretty-print the full cached JSON record for a repo. |
 | `stargaze stats` | Total cached count, last sync time, top languages. |
 | `stargaze list [--limit N]` | List all cached repos sorted by stargazer count. |
@@ -252,7 +252,7 @@ hyperfine --warmup 1 'stargaze sync'
 
 ## Tests
 
-Around **108 tests** across unit + integration + live tiers:
+Around **66 tests** across unit + integration + live tiers:
 
 ```bash
 cargo test                        # hermetic suite (88 tests, no network)
@@ -286,7 +286,7 @@ Both projects address the same frustration. They make very different architectur
 | **README extraction** | ✅ `--with-readmes`, rayon-parallel | ✅ single-threaded loop |
 | **Scheduled refresh** | ✅ systemd / launchd / cron / GH Actions examples | ✅ weekly GH Actions cron |
 | **Search — keyword** | ✅ substring + BM25-ish scoring over name/desc/topics/lang/README, LRU-cached | ❌ delegates everything to Cloudflare AutoRAG |
-| **Search — semantic** | 🔜 v0.3 via `fastembed` (tracked) | ✅ Cloudflare AutoRAG embeddings |
+| **Search — semantic** | ✅ `fastembed` local embeddings + cosine similarity (`--semantic` flag) | ✅ Cloudflare AutoRAG embeddings |
 | **Language / topic filters** | ✅ | ❌ |
 | **Stats / list / show commands** | ✅ | ❌ |
 | **Prune stale entries** | ✅ `--prune` | ❌ |
@@ -304,9 +304,8 @@ The short version: `stargaze` is local-first, CI-tested, and runs anywhere Rust 
 
 ## Roadmap
 
-- **v0.1.2** (current): sync, parallel README fetch, substring search with weighted scoring, LRU cache, MCP stdio server, HTTP JSON API server, 108 tests, criterion benches, GH Actions CI + release workflow.
-- **v0.2**: `stargaze diff --since DATE` — delta of additions/removals (already schema-ready via `starred_at`).
-- **v0.3**: [`fastembed-rs`](https://github.com/Anush008/fastembed-rs) local embeddings + cosine-similarity semantic search (`stargaze semantic <query>`).
+- **v0.2.0** (current): Semantic search with `fastembed` local embeddings + cosine similarity, sync, parallel README fetch, substring search with weighted scoring, LRU cache, MCP stdio server, HTTP JSON API server, 66+ tests, criterion benches, GH Actions CI + release workflow.
+- **v0.3**: `stargaze diff --since DATE` — delta of additions/removals (already schema-ready via `starred_at`).
 - **v0.4**: fuzzy matching with `fuzzy-matcher`, OR mode search (foo OR bar), topic boost multipliers, export formats (markdown, opml, csv), `stargaze categorize` heuristic grouping, `stargaze open <name>` launcher.
 ## License
 

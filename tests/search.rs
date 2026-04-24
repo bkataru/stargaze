@@ -32,6 +32,7 @@ fn r(
         cached_at: Utc::now(),
         readme: None,
         readme_fetched_at: None,
+        embedding: None,
     }
 }
 
@@ -113,7 +114,7 @@ fn corpus() -> Vec<Repo> {
 #[test]
 fn search_postgres_finds_three() {
     let idx = RepoIndex::new(corpus());
-    let hits = idx.search("postgres", None, None, 100);
+    let hits = idx.search("postgres", None, None, 100, false, false, false, false);
     let names: Vec<&str> = hits.iter().map(|h| h.repo.full_name.as_str()).collect();
     assert!(names.contains(&"postgresml/postgresml"));
     assert!(names.contains(&"supabase/supabase"));
@@ -123,7 +124,7 @@ fn search_postgres_finds_three() {
 #[test]
 fn search_sorts_by_score_then_stars_desc() {
     let idx = RepoIndex::new(corpus());
-    let hits = idx.search("rust", None, None, 100);
+    let hits = idx.search("rust", None, None, 100, false, false, false, false);
     for w in hits.windows(2) {
         assert!(
             w[0].score > w[1].score
@@ -139,7 +140,7 @@ fn search_sorts_by_score_then_stars_desc() {
 #[test]
 fn search_lang_filter_rust_only() {
     let idx = RepoIndex::new(corpus());
-    let hits = idx.search("", Some("rust"), None, 100);
+    let hits = idx.search("", Some("rust"), None, 100, false, false, false, false);
     assert!(!hits.is_empty());
     for h in &hits {
         assert_eq!(h.repo.language.as_deref(), Some("Rust"));
@@ -149,15 +150,15 @@ fn search_lang_filter_rust_only() {
 #[test]
 fn search_lang_filter_is_case_insensitive() {
     let idx = RepoIndex::new(corpus());
-    let a = idx.search("", Some("RUST"), None, 100);
-    let b = idx.search("", Some("rust"), None, 100);
+    let a = idx.search("", Some("RUST"), None, 100, false, false, false, false);
+    let b = idx.search("", Some("rust"), None, 100, false, false, false, false);
     assert_eq!(a.len(), b.len());
 }
 
 #[test]
 fn search_topic_filter_postgres() {
     let idx = RepoIndex::new(corpus());
-    let hits = idx.search("", None, Some("postgres"), 100);
+    let hits = idx.search("", None, Some("postgres"), 100, false, false, false, false);
     for h in &hits {
         assert!(h.repo.topics.iter().any(|t| t == "postgres"));
     }
@@ -167,7 +168,7 @@ fn search_topic_filter_postgres() {
 #[test]
 fn search_combined_query_and_lang_filter() {
     let idx = RepoIndex::new(corpus());
-    let hits = idx.search("postgres", Some("TypeScript"), None, 100);
+    let hits = idx.search("postgres", Some("TypeScript"), None, 100, false, false, false, false);
     for h in &hits {
         assert_eq!(h.repo.language.as_deref(), Some("TypeScript"));
     }
@@ -177,8 +178,8 @@ fn search_combined_query_and_lang_filter() {
 #[test]
 fn search_limit_truncates_result_set() {
     let idx = RepoIndex::new(corpus());
-    let full = idx.search("", None, None, 100);
-    let cut = idx.search("", None, None, 3);
+    let full = idx.search("", None, None, 100, false, false, false, false);
+    let cut = idx.search("", None, None, 3, false, false, false, false);
     assert_eq!(full.len(), 10);
     assert_eq!(cut.len(), 3);
     // The top 3 of `cut` should equal the top 3 of `full` (same sort).
@@ -190,14 +191,14 @@ fn search_limit_truncates_result_set() {
 #[test]
 fn search_empty_query_matches_all() {
     let idx = RepoIndex::new(corpus());
-    let hits = idx.search("", None, None, 100);
+    let hits = idx.search("", None, None, 100, false, false, false, false);
     assert_eq!(hits.len(), corpus().len());
 }
 
 #[test]
 fn search_unknown_term_returns_empty() {
     let idx = RepoIndex::new(corpus());
-    let hits = idx.search("definitelynothinglikethis", None, None, 100);
+    let hits = idx.search("definitelynothinglikethis", None, None, 100, false, false, false, false);
     assert!(hits.is_empty());
 }
 
@@ -205,7 +206,7 @@ fn search_unknown_term_returns_empty() {
 fn match_count_equals_unlimited_search_len() {
     let idx = RepoIndex::new(corpus());
     let total = idx.match_count("rust", None, None);
-    let all = idx.search("rust", None, None, 1_000_000);
+    let all = idx.search("rust", None, None, 1_000_000, false, false, false, false);
     assert_eq!(total, all.len());
 }
 
@@ -213,27 +214,27 @@ fn match_count_equals_unlimited_search_len() {
 fn cache_grows_on_distinct_queries() {
     let idx = RepoIndex::new(corpus());
     assert_eq!(idx.cache_len(), 0);
-    let _ = idx.search("postgres", None, None, 10);
-    let _ = idx.search("rust", None, None, 10);
-    let _ = idx.search("javascript", None, None, 10);
+    let _ = idx.search("postgres", None, None, 10, false, false, false, false);
+    let _ = idx.search("rust", None, None, 10, false, false, false, false);
+    let _ = idx.search("javascript", None, None, 10, false, false, false, false);
     assert_eq!(idx.cache_len(), 3);
 }
 
 #[test]
 fn cache_reuse_does_not_grow_on_repeat() {
     let idx = RepoIndex::new(corpus());
-    let _ = idx.search("postgres", None, None, 10);
-    let _ = idx.search("postgres", None, None, 10);
-    let _ = idx.search("postgres", None, None, 10);
+    let _ = idx.search("postgres", None, None, 10, false, false, false, false);
+    let _ = idx.search("postgres", None, None, 10, false, false, false, false);
+    let _ = idx.search("postgres", None, None, 10, false, false, false, false);
     assert_eq!(idx.cache_len(), 1);
 }
 
 #[test]
 fn cache_key_considers_lang_filter() {
     let idx = RepoIndex::new(corpus());
-    let _ = idx.search("rust", None, None, 10);
-    let _ = idx.search("rust", Some("Rust"), None, 10);
-    let _ = idx.search("rust", Some("TypeScript"), None, 10);
+    let _ = idx.search("rust", None, None, 10, false, false, false, false);
+    let _ = idx.search("rust", Some("Rust"), None, 10, false, false, false, false);
+    let _ = idx.search("rust", Some("TypeScript"), None, 10, false, false, false, false);
     assert_eq!(idx.cache_len(), 3);
 }
 
@@ -253,9 +254,9 @@ fn large_corpus_search_completes_quickly() {
         ));
     }
     let idx = RepoIndex::new(big);
-    let hits = idx.search("synthetic", None, None, 50);
+    let hits = idx.search("synthetic", None, None, 50, false, false, false, false);
     assert_eq!(hits.len(), 50);
-    let rust_hits = idx.search("", Some("Rust"), None, 10_000);
+    let rust_hits = idx.search("", Some("Rust"), None, 10_000, false, false, false, false);
     assert!(!rust_hits.is_empty());
     for h in &rust_hits {
         assert_eq!(h.repo.language.as_deref(), Some("Rust"));

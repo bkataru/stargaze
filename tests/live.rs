@@ -43,16 +43,16 @@ fn skip_if_no_token(test_name: &str) -> Option<String> {
     }
 }
 
-#[test]
+#[async_std::test]
 #[ignore]
-fn live_starred_first_page() {
+async fn live_starred_first_page() {
     let Some(t) = skip_if_no_token("live_starred_first_page") else {
         return;
     };
     let client = GhClient::new(t);
     // Hitting `/user/starred` requires a token that owns stars; that's our
     // `bkataru` setup. Just make sure at least one page comes back.
-    let items = client.starred(None).expect("live starred call");
+    let items = client.starred(None).await.expect("live starred call");
     assert!(
         !items.is_empty(),
         "expected at least one starred repo, got zero"
@@ -65,9 +65,9 @@ fn live_starred_first_page() {
     );
 }
 
-#[test]
+#[async_std::test]
 #[ignore]
-fn live_starred_public_user() {
+async fn live_starred_public_user() {
     let Some(t) = skip_if_no_token("live_starred_public_user") else {
         return;
     };
@@ -76,6 +76,7 @@ fn live_starred_public_user() {
     // authenticated user's actual stars, just validates pagination.
     let items = client
         .starred(Some("rust-lang-nursery"))
+        .await
         .expect("live public starred");
     // `rust-lang-nursery` is an org without stars, so zero results is
     // acceptable; we're just asserting the call path works end-to-end.
@@ -86,14 +87,14 @@ fn live_starred_public_user() {
     );
 }
 
-#[test]
+#[async_std::test]
 #[ignore]
-fn live_readme_fetch_rust_lang_rust() {
+async fn live_readme_fetch_rust_lang_rust() {
     let Some(t) = skip_if_no_token("live_readme_fetch_rust_lang_rust") else {
         return;
     };
     let client = GhClient::new(t);
-    let body = client.readme("rust-lang", "rust").expect("fetch README");
+    let body = client.readme("rust-lang", "rust").await.expect("fetch README");
     assert!(!body.is_empty(), "expected non-empty README");
     assert!(
         body.to_lowercase().contains("rust"),
@@ -101,9 +102,9 @@ fn live_readme_fetch_rust_lang_rust() {
     );
 }
 
-#[test]
+#[async_std::test]
 #[ignore]
-fn live_readme_fetch_missing_repo_returns_empty() {
+async fn live_readme_fetch_missing_repo_returns_empty() {
     let Some(t) = skip_if_no_token("live_readme_fetch_missing_repo_returns_empty") else {
         return;
     };
@@ -112,13 +113,14 @@ fn live_readme_fetch_missing_repo_returns_empty() {
     // to pick a fresher sentinel.
     let body = client
         .readme("bkataru", "stargaze-definitely-nonexistent-sentinel-9d8f7a")
+        .await
         .expect("404 should not error");
     assert_eq!(body, "", "missing repos should return empty, not fail");
 }
 
-#[test]
+#[async_std::test]
 #[ignore]
-fn live_parallel_readme_batch() {
+async fn live_parallel_readme_batch() {
     let Some(t) = skip_if_no_token("live_parallel_readme_batch") else {
         return;
     };
@@ -151,9 +153,10 @@ fn live_parallel_readme_batch() {
             cached_at: chrono::Utc::now(),
             readme: None,
             readme_fetched_at: None,
+            embedding: None,
         })
         .collect();
-    let fetched = fetch_readmes_parallel(&t, repos, 3);
+    let fetched = fetch_readmes_parallel(&t, repos, 3).await;
     assert_eq!(fetched.len(), 3);
     let hit = fetched.iter().filter(|r| r.readme.is_some()).count();
     assert_eq!(hit, 3, "all 3 well-known repos should return a README");
@@ -163,9 +166,9 @@ fn live_parallel_readme_batch() {
     }
 }
 
-#[test]
+#[async_std::test]
 #[ignore]
-fn live_mini_sync_roundtrip() {
+async fn live_mini_sync_roundtrip() {
     let Some(t) = skip_if_no_token("live_mini_sync_roundtrip") else {
         return;
     };
@@ -180,7 +183,7 @@ fn live_mini_sync_roundtrip() {
     // For speed, only sync via user's own stars — pagination covered in
     // live_starred_first_page. Here we test the *sync pipeline* end-to-end
     // against a real DB.
-    let items = client.starred(None).expect("live starred");
+    let items = client.starred(None).await.expect("live starred");
     let mut repos = Vec::new();
     for item in items.iter().take(50) {
         if let Ok(r) = Repo::from_api(item) {
@@ -194,6 +197,6 @@ fn live_mini_sync_roundtrip() {
     let loaded = load_all(&db).expect("load_all");
     let idx = RepoIndex::new(loaded);
     assert_eq!(idx.len(), repos.len());
-    let hits = idx.search("", None, None, 1_000_000);
+    let hits = idx.search("", None, None, 1_000_000, false, false, false, false);
     assert_eq!(hits.len(), repos.len());
 }

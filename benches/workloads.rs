@@ -27,7 +27,7 @@ fn synth_repo(i: usize) -> Repo {
         full_name: format!("user{}/repo{}", i % 500, i),
         owner: format!("user{}", i % 500),
         name: format!("repo{}", i),
-        description: Some(format!(
+        description: Some(format!(...
             "Synthetic repo {} for criterion benchmarks — contains the word postgres occasionally",
             i
         )),
@@ -48,6 +48,7 @@ fn synth_repo(i: usize) -> Repo {
         cached_at: Utc::now(),
         readme: None,
         readme_fetched_at: None,
+        embedding: None,
     }
 }
 
@@ -79,7 +80,7 @@ fn bench_search_cold(c: &mut Criterion) {
                 || RepoIndex::new(synth_corpus(n)),
                 |idx| {
                     // Rebuild index each iteration so the LRU cache is empty.
-                    let hits = idx.search(black_box("postgres"), None, None, 30);
+                    let hits = idx.search(black_box("postgres"), None, None, 30, false, false, false, false);
                     black_box(hits.len());
                 },
                 criterion::BatchSize::LargeInput,
@@ -93,7 +94,7 @@ fn bench_search_warm(c: &mut Criterion) {
     let mut g = c.benchmark_group("search_warm");
     let idx = RepoIndex::new(synth_corpus(3_000));
     // Prime the LRU cache once.
-    let _ = idx.search("postgres", None, None, 30);
+    let _ = idx.search("postgres", None, None, 30, false, false, false, false);
     g.bench_function("same_query_3k", |b| {
         b.iter(|| {
             let hits = idx.search(black_box("postgres"), None, None, 30);
@@ -108,19 +109,19 @@ fn bench_search_with_filters(c: &mut Criterion) {
     let idx = RepoIndex::new(synth_corpus(3_000));
     g.bench_function("lang_rust_3k", |b| {
         b.iter(|| {
-            let hits = idx.search("", Some("Rust"), None, 30);
+            let hits = idx.search("", Some("Rust"), None, 30, false, false, false, false);
             black_box(hits.len());
         });
     });
     g.bench_function("topic_general_3k", |b| {
         b.iter(|| {
-            let hits = idx.search("", None, Some("general"), 30);
+            let hits = idx.search("", None, Some("general"), 30, false, false, false, false);
             black_box(hits.len());
         });
     });
     g.bench_function("query_lang_topic_3k", |b| {
         b.iter(|| {
-            let hits = idx.search("postgres", Some("Rust"), Some("general"), 30);
+            let hits = idx.search("postgres", Some("Rust"), Some("general"), 30, false, false, false, false);
             black_box(hits.len());
         });
     });

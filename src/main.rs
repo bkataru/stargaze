@@ -84,6 +84,9 @@ enum Cmd {
         /// Boost score when topic matches exactly
         #[arg(long, default_value_t = false)]
         topic_boost: bool,
+        /// Use semantic search (keyword-based boost)
+        #[arg(long, default_value_t = false)]
+        semantic: bool,
     },
     /// Show the full cached record for a specific repo.
     Show {
@@ -153,7 +156,8 @@ async fn main() -> Result<()> {
             fuzzy,
             or_mode,
             topic_boost,
-        } => cmd_search(Arc::clone(&db), &query, limit, lang, topic, fuzzy, or_mode, topic_boost).await,
+            semantic,
+        } => cmd_search(Arc::clone(&db), &query, limit, lang, topic, fuzzy, or_mode, topic_boost, semantic).await,
         Cmd::Show { full_name } => cmd_show(Arc::clone(&db), &full_name).await,
         Cmd::Stats => cmd_stats(Arc::clone(&db)).await,
         Cmd::List { limit } => cmd_list(Arc::clone(&db), limit).await,
@@ -264,6 +268,7 @@ async fn cmd_search(
     fuzzy: bool,
     or_mode: bool,
     topic_boost: bool,
+    semantic: bool,
 ) -> Result<()> {
     let repos = spawn_blocking({
         let db = db.clone();
@@ -274,7 +279,7 @@ async fn cmd_search(
         return Ok(());
     }
     let idx = RepoIndex::new(repos);
-    let hits = idx.search(query, lang.as_deref(), topic.as_deref(), limit, fuzzy, or_mode, topic_boost);
+    let hits = idx.search(query, lang.as_deref(), topic.as_deref(), limit, fuzzy, or_mode, topic_boost, semantic);
 
     if hits.is_empty() {
         println!("(no matches for {:?})", query);

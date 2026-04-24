@@ -45,6 +45,7 @@ fn make_repo(name: &str, stars: u64) -> Repo {
         cached_at: Utc::now(),
         readme: None,
         readme_fetched_at: None,
+        embedding: None,
     }
 }
 
