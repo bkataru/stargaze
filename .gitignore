@@ -9,3 +9,4 @@ stargaze-*.zip
 Cargo.lock.bak
 criterion/
 *.profraw
+.fastembed_cache/
