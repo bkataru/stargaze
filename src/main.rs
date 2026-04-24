@@ -13,6 +13,7 @@ use stargaze::{
     resolve_token, retain_repos, run_api_server, run_mcp_stdio, truncate, upsert_repos, GhClient,
     Repo, RepoIndex, SearchHit,
 };
+use async_std::task::spawn_blocking;
 
 #[derive(Parser)]
 #[command(
@@ -72,6 +73,15 @@ enum Cmd {
         /// Restrict by topic (exact match, case-insensitive)
         #[arg(long)]
         topic: Option<String>,
+        /// Use fuzzy matching (instead of substring)
+        #[arg(long, default_value_t = false)]
+        fuzzy: bool,
+        /// Match any term (OR) instead of all terms (AND)
+        #[arg(long, default_value_t = false)]
+        or_mode: bool,
+        /// Boost score when topic matches exactly
+        #[arg(long, default_value_t = false)]
+        topic_boost: bool,
     },
     /// Show the full cached record for a specific repo.
     Show {
@@ -110,13 +120,14 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<()> {
+#[async_std::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let db_path = match cli.db {
         Some(p) => p,
         None => default_db_path()?,
     };
-    let db = open_db(&db_path)?;
+    let db = spawn_blocking(move || open_db(&db_path)).await??;
 
     match cli.cmd {
         Cmd::Sync {
@@ -130,18 +141,21 @@ fn main() -> Result<()> {
         }
         Cmd::Readmes { concurrency, force } => {
             let token = resolve_token(cli.token)?;
-            cmd_readmes(&db, token, concurrency, force)
+            cmd_readmes(&db, token, concurrency, force).await
         }
         Cmd::Search {
             query,
             limit,
             lang,
             topic,
-        } => cmd_search(&db, &query, limit, lang, topic),
-        Cmd::Show { full_name } => cmd_show(&db, &full_name),
-        Cmd::Stats => cmd_stats(&db),
-        Cmd::List { limit } => cmd_list(&db, limit),
-        Cmd::Serve => run_mcp_stdio(db),
+            fuzzy,
+            or_mode,
+            topic_boost,
+        } => cmd_search(&db, &query, limit, lang, topic, fuzzy, or_mode, topic_boost).await,
+        Cmd::Show { full_name } => cmd_show(&db, &full_name).await,
+        Cmd::Stats => cmd_stats(&db).await,
+        Cmd::List { limit } => cmd_list(&db, limit).await,
+        Cmd::Serve => spawn_blocking(move || run_mcp_stdio(db)).await??,
         Cmd::Api {
             bind,
             api_key,
@@ -150,12 +164,12 @@ fn main() -> Result<()> {
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid --bind {}: {}", bind, e))?;
-            run_api_server(db, addr, api_key, threads)
+            spawn_blocking(move || run_api_server(db, addr, api_key, threads)).await??
         }
     }
 }
 
-fn cmd_sync(
+async fn cmd_sync(
     db: &redb::Database,
     token: String,
     user: Option<String>,
@@ -165,7 +179,7 @@ fn cmd_sync(
 ) -> Result<()> {
     eprintln!("stargaze: syncing stars from github.com ...");
     let client = GhClient::new(token.clone());
-    let items = client.starred(user.as_deref())?;
+    let items = client.starred(user.as_deref()).await?;
     eprintln!("stargaze: fetched {} raw items", items.len());
 
     let mut repos = Vec::with_capacity(items.len());
@@ -182,18 +196,20 @@ fn cmd_sync(
             repos.len(),
             concurrency
         );
-        repos = fetch_readmes_parallel(&token, repos, concurrency);
+        repos = fetch_readmes_parallel(&token, repos, concurrency).await;
         let fetched = repos.iter().filter(|r| r.readme.is_some()).count();
         eprintln!("stargaze: fetched {} READMEs", fetched);
     }
 
-    let n = upsert_repos(db, &repos)?;
+    let repos_clone = repos.clone();
+    let n = spawn_blocking(move || upsert_repos(db, &repos_clone)).await??;
     eprintln!("stargaze: upserted {} repos", n);
 
     if prune {
         let keep: std::collections::HashSet<String> =
             repos.iter().map(|r| r.full_name.clone()).collect();
-        let removed = retain_repos(db, &keep)?;
+        let keep_clone = keep.clone();
+        let removed = spawn_blocking(move || retain_repos(db, &keep_clone)).await??;
         if removed > 0 {
             eprintln!("stargaze: pruned {} unstarred repos", removed);
         }
@@ -201,8 +217,11 @@ fn cmd_sync(
     Ok(())
 }
 
-fn cmd_readmes(db: &redb::Database, token: String, concurrency: usize, force: bool) -> Result<()> {
-    let all = load_all(db)?;
+async fn cmd_readmes(db: &redb::Database, token: String, concurrency: usize, force: bool) -> Result<()> {
+    let all = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await??;
     let targets: Vec<Repo> = if force {
         all
     } else {
@@ -217,8 +236,11 @@ fn cmd_readmes(db: &redb::Database, token: String, concurrency: usize, force: bo
         targets.len(),
         concurrency
     );
-    let fetched = fetch_readmes_parallel(&token, targets, concurrency);
-    let upserted = upsert_repos(db, &fetched)?;
+    let fetched = fetch_readmes_parallel(&token, targets, concurrency).await;
+    let upserted = spawn_blocking({
+        let db = db.clone();
+        move || upsert_repos(&db, &fetched)
+    }).await??;
     let hit = fetched.iter().filter(|r| r.readme.is_some()).count();
     eprintln!(
         "stargaze: upserted {} repos ({} with fresh README)",
@@ -227,14 +249,17 @@ fn cmd_readmes(db: &redb::Database, token: String, concurrency: usize, force: bo
     Ok(())
 }
 
-fn cmd_search(
+async fn cmd_search(
     db: &redb::Database,
     query: &str,
     limit: usize,
     lang: Option<String>,
     topic: Option<String>,
 ) -> Result<()> {
-    let repos = load_all(db)?;
+    let repos = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await??;
     if repos.is_empty() {
         eprintln!("(cache is empty — run `stargaze sync` first)");
         return Ok(());
@@ -269,8 +294,12 @@ fn print_hit(h: &SearchHit<'_>) {
     );
 }
 
-fn cmd_show(db: &redb::Database, full_name: &str) -> Result<()> {
-    match load_one(db, full_name)? {
+async fn cmd_show(db: &redb::Database, full_name: &str) -> Result<()> {
+    match spawn_blocking({
+        let db = db.clone();
+        let full_name = full_name.to_string();
+        move || load_one(&db, &full_name)
+    }).await?? {
         Some(r) => {
             println!("{}", serde_json::to_string_pretty(&r)?);
             Ok(())
@@ -282,16 +311,28 @@ fn cmd_show(db: &redb::Database, full_name: &str) -> Result<()> {
     }
 }
 
-fn cmd_stats(db: &redb::Database) -> Result<()> {
-    let total = count_repos(db)?;
-    let last_sync = read_meta(db, "last_sync")?.unwrap_or_else(|| "(never)".into());
-    let last_count = read_meta(db, "last_sync_count")?.unwrap_or_else(|| "0".into());
+async fn cmd_stats(db: &redb::Database) -> Result<()> {
+    let total = spawn_blocking({
+        let db = db.clone();
+        move || count_repos(&db)
+    }).await??;
+    let last_sync = spawn_blocking({
+        let db = db.clone();
+        move || read_meta(&db, "last_sync")
+    }).await??;
+    let last_count = spawn_blocking({
+        let db = db.clone();
+        move || read_meta(&db, "last_sync_count")
+    }).await??;
     println!("stargaze stats");
     println!("  cached repos : {}", total);
-    println!("  last sync    : {}", last_sync);
-    println!("  last sync n  : {}", last_count);
+    println!("  last sync    : {}", last_sync.unwrap_or_else(|| "(never)".into()));
+    println!("  last sync n  : {}", last_count.unwrap_or_else(|| "0".into()));
 
-    let repos = load_all(db)?;
+    let repos = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await??;
     let mut by_lang: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for r in &repos {
         let l = r.language.as_deref().unwrap_or("-");
@@ -306,8 +347,11 @@ fn cmd_stats(db: &redb::Database) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(db: &redb::Database, limit: usize) -> Result<()> {
-    let mut all = load_all(db)?;
+async fn cmd_list(db: &redb::Database, limit: usize) -> Result<()> {
+    let mut all = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await??;
     all.sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count));
     for r in all.iter().take(limit) {
         let lang = r.language.as_deref().unwrap_or("-");

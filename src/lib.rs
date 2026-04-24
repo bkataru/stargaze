@@ -16,10 +16,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
 use lru::LruCache;
 use rayon::prelude::*;
+use futures::stream::{self, StreamExt};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
@@ -417,7 +416,7 @@ impl RepoIndex {
 /// The `base_url` is parameterizable so integration tests can point at a
 /// local mock server (see `tests/gh_mock.rs`).
 pub struct GhClient {
-    agent: ureq::Agent,
+    client: surf::Client,
     token: String,
     base_url: String,
 }
@@ -428,12 +427,9 @@ impl GhClient {
     }
 
     pub fn with_base(token: String, base_url: String) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(30))
-            .build();
+        let client = surf::Client::new();
         Self {
-            agent,
+            client,
             token,
             base_url,
         }
@@ -444,7 +440,7 @@ impl GhClient {
     /// Walks every page of the `/user/starred` or `/users/{user}/starred`
     /// endpoint by following `Link: ...; rel="next"` headers. Stops on the
     /// first page without a next link or on the first empty page.
-    pub fn starred(&self, user: Option<&str>) -> Result<Vec<serde_json::Value>> {
+    pub async fn starred(&self, user: Option<&str>) -> Result<Vec<serde_json::Value>> {
         let first = match user {
             Some(u) => format!("{}/users/{}/starred?per_page=100", self.base_url, u),
             None => format!("{}/user/starred?per_page=100", self.base_url),
@@ -455,21 +451,23 @@ impl GhClient {
 
         loop {
             eprint!("  fetching page {} ...", page);
-            let resp = self
-                .agent
-                .get(&url)
-                .set("Authorization", &format!("Bearer {}", self.token))
-                .set(
-                    "Accept",
-                    "application/vnd.github.star+json, application/vnd.github+json",
-                )
-                .set("X-GitHub-Api-Version", "2022-11-28")
-                .call()
-                .with_context(|| format!("GET {}", url))?;
+            let mut req = surf::get(&url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .header("Accept", "application/vnd.github.star+json, application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", USER_AGENT);
+            let mut resp = req
+                .await
+                .map_err(|e| anyhow!("GET {}: {}", url, e))?;
 
-            let link = resp.header("Link").map(|s| s.to_string());
+            let link = resp
+                .header("Link")
+                .map(|v| v.to_string());
 
-            let body: serde_json::Value = resp.into_json().context("decode JSON response")?;
+            let body: serde_json::Value = resp
+                .body_json::<serde_json::Value>()
+                .await
+                .map_err(|e| anyhow!("decode JSON response: {}", e))?;
             let arr = body
                 .as_array()
                 .ok_or_else(|| anyhow!("expected JSON array, got {}", body))?;
@@ -496,19 +494,18 @@ impl GhClient {
     /// the unparsed file body (not base64-encoded). 404 is rewritten to an
     /// empty string so a missing README doesn't abort a batch sync.
     /// Returned text is truncated to [`README_MAX_BYTES`].
-    pub fn readme(&self, owner: &str, name: &str) -> Result<String> {
+    pub async fn readme(&self, owner: &str, name: &str) -> Result<String> {
         let url = format!("{}/repos/{}/{}/readme", self.base_url, owner, name);
-        let resp = self
-            .agent
-            .get(&url)
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .set("Accept", "application/vnd.github.raw")
-            .set("X-GitHub-Api-Version", "2022-11-28")
-            .call();
+        let mut req = surf::get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "application/vnd.github.raw")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", USER_AGENT);
 
-        let text = match resp {
-            Ok(r) => r.into_string().unwrap_or_default(),
-            Err(ureq::Error::Status(404, _)) => return Ok(String::new()),
+        let res = req.await;
+        let text = match res {
+            Ok(mut r) => r.body_string().await.unwrap_or_default(),
+            Err(e) if e.status() == 404 => return Ok(String::new()),
             Err(e) => return Err(anyhow!("GET {}: {}", url, e)),
         };
 
@@ -526,43 +523,61 @@ impl GhClient {
     }
 }
 
-/// Fetch READMEs for every repo in `repos` in parallel via rayon.
+/// Fetch READMEs for every repo in `repos` in parallel using async HTTP requests.
 ///
-/// Each rayon thread gets its own `ureq::Agent` (cheap — just an Arc
-/// internally) so HTTP connection state doesn't bottleneck on a single
-/// pool. `max_concurrency` caps how many requests run at once to stay
-/// under GitHub's secondary rate limit (default: 8).
+/// Concurrency is limited by `max_concurrency` (defaults to 1 if 0). Each
+/// request uses a fresh `surf::Client` (cheap to clone). Results preserve
+/// the original input ordering.
 ///
 /// Returns a new `Vec<Repo>` with `readme` + `readme_fetched_at` populated
-/// on each entry; source ordering is preserved.
-pub fn fetch_readmes_parallel(token: &str, repos: Vec<Repo>, max_concurrency: usize) -> Vec<Repo> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_concurrency.max(1))
-        .thread_name(|i| format!("stargaze-readme-{}", i))
-        .build()
-        .expect("build readme thread pool");
-
-    pool.install(|| {
-        repos
-            .into_par_iter()
-            .map(|mut r| {
-                // Build a fresh client per task. `ureq::Agent` is Send+Sync
-                // and cheap to clone, but a per-thread client keeps TLS
-                // connection state thread-local and avoids contention.
-                let client = GhClient::new(token.to_string());
-                match client.readme(&r.owner, &r.name) {
-                    Ok(body) => {
-                        r.readme = Some(body);
-                        r.readme_fetched_at = Some(Utc::now());
+/// on each entry.
+pub async fn fetch_readmes_parallel(token: &str, repos: Vec<Repo>, max_concurrency: usize) -> Vec<Repo> {
+    let max_concurrency = max_concurrency.max(1);
+    let client = surf::Client::new();
+    let tasks = repos.into_iter().enumerate().map(|(idx, mut r)| {
+        let client = client.clone();
+        let token = token.to_string();
+        async move {
+            let url = format!("https://api.github.com/repos/{}/{}/readme", r.owner, r.name);
+            let mut req = client.get(&url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/vnd.github.raw");
+            if !token.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            }
+            match req.await {
+                Ok(mut response) if response.status() == 200 => {
+                    let body = response.body_string().await.unwrap_or_default();
+                    let truncated = if body.len() > README_MAX_BYTES {
+                        let mut cut = README_MAX_BYTES;
+                        while cut > 0 && !body.is_char_boundary(cut) {
+                            cut -= 1;
                     }
+                        body[..cut].to_string()
+                    } else {
+                        body
+                    };
+                    r.readme = Some(truncated);
+                        r.readme_fetched_at = Some(Utc::now());
+                }
+                Ok(response) if response.status() == 404 => {
+                    r.readme = Some(String::new());
+                        r.readme_fetched_at = Some(Utc::now());
+                }
+                Ok(response) => {
+                    eprintln!("  readme fetch failed for {}: HTTP {}", r.full_name, response.status());
+                }
                     Err(e) => {
                         eprintln!("  readme fetch failed for {}: {}", r.full_name, e);
-                    }
                 }
-                r
-            })
-            .collect()
-    })
+                }
+            (idx, r)
+}
+    }).collect::<Vec<_>>();
+
+    let mut results: Vec<(usize, Repo)> = stream::iter(tasks).buffer_unordered(max_concurrency).collect().await;
+    results.sort_by_key(|(idx, _)| *idx);
+    results.into_iter().map(|(_, r)| r).collect()
 }
 
 /// Extract the URL marked `rel="next"` from a GitHub Link header, if any.
