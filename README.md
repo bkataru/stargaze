@@ -28,7 +28,7 @@ cd stargaze
 cargo install --path .
 ```
 
-Needs Rust 1.76+. Everything is pure Rust — no `libsqlite3`, no `openssl`, no C toolchain. The release binary is fully static (aside from libc).
+Needs Rust 1.76+. The release binary is fully static (aside from libc).
 
 Prebuilt binaries for Linux / macOS / Windows are attached to every [tagged release](https://github.com/bkataru/stargaze/releases).
 
@@ -111,7 +111,7 @@ curl 'http://127.0.0.1:7879/api/v1/search?q=postgres&limit=5'
 curl http://127.0.0.1:7879/api/v1/stars/rust-lang/rust
 ```
 
-Backed by [`tiny_http`](https://github.com/tiny-http/tiny-http) (pure Rust, blocking, no tokio). Thread pool size configurable via `--threads`. CORS is enabled (`Access-Control-Allow-Origin: *`) so you can hit it from localhost web UIs.
+Backed by [`tiny_http`](https://github.com/tiny-http/tiny-http) (blocking, no tokio). Thread pool size configurable via `--threads`. CORS is enabled (`Access-Control-Allow-Origin: *`) so you can hit it from localhost web UIs.
 
 ## MCP server mode
 
@@ -139,7 +139,7 @@ Tools exposed:
 | `list_stars` | `limit?` | Repos sorted by stargazer count |
 | `stats` | — | Cache size + last sync metadata |
 
-The implementation is hand-rolled JSON-RPC 2.0 over stdio — no `tokio`, no external MCP library — so the binary stays single-static and cold-starts instantly.
+The implementation is hand-rolled JSON-RPC 2.0 over stdio — no `tokio`, no external MCP library or crate in order to minimize on compile time overhead.
 
 ## Auth
 
@@ -155,7 +155,7 @@ The easiest bootstrap if you already use the `gh` CLI:
 export GH_TOKEN=$(gh auth token)
 ```
 
-`stargaze` never shells out — all HTTP traffic goes through [`ureq`](https://github.com/algesten/ureq) with rustls (pure-Rust TLS).
+`stargaze` never shells out — all HTTP traffic goes through [`ureq`](https://github.com/algesten/ureq) with rustls (Rust-based TLS).
 
 ## Scheduled sync
 
@@ -250,10 +250,10 @@ hyperfine --warmup 1 'stargaze sync'
 
 ## Tests
 
-Around **102 tests** across unit + integration + live tiers:
+Test coverage extends across unit + integration + live tiers:
 
 ```bash
-cargo test                        # hermetic suite (102 tests, no network)
+cargo test                        # hermetic suite (no network)
 cargo test -- --ignored           # + 6 live tests that hit the real GitHub API
 ```
 
@@ -305,6 +305,7 @@ The short version: `stargaze` is local-first, CI-tested, and runs anywhere Rust 
 |- **v0.3.0** (current): Semantic search with `fastembed` local embeddings + cosine similarity, sync, parallel README fetch, substring search with weighted scoring, LRU cache, MCP stdio server, HTTP JSON API server, 102 tests, coverage_tests, criterion benches, GH Actions CI + release workflow.
 |- **v0.4**: `stargaze diff --since DATE` — delta of additions/removals (already schema-ready via `starred_at`).
 |- **v0.5**: fuzzy matching with `fuzzy-matcher`, OR mode search (foo OR bar), topic boost multipliers, export formats (markdown, opml, csv), `stargaze categorize` heuristic grouping, `stargaze open <name>` launcher.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).
