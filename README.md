@@ -1,14 +1,12 @@
 # stargaze
 
-**Cache and search your GitHub stars from the terminal. Pure Rust. Single binary. No cloud.**
+**Cache and search your GitHub stars from the terminal**
 
 [![CI](https://github.com/bkataru/stargaze/actions/workflows/ci.yml/badge.svg)](https://github.com/bkataru/stargaze/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/stargaze.svg)](https://crates.io/crates/stargaze)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-A small Rust CLI that pulls your starred GitHub repos into a local embedded database, lets you keyword-search them (README text included), and exposes the same cache to AI agents as an MCP server. No daemon, no cloud, no C dependencies.
-
----
+> A small Rust CLI that pulls your starred GitHub repos into a local embedded database, lets you keyword-search them (README text included), and exposes the same cache to AI agents as an MCP server. 
 
 ## Why
 
