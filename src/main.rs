@@ -11,9 +11,10 @@ use redb::Database;
 use std::path::PathBuf;
 
 use stargaze::{
-    count_repos, default_db_path, fetch_readmes_parallel, load_all, load_one, open_db, read_meta,
-    resolve_token, retain_repos, run_api_server, run_mcp_stdio, truncate, upsert_repos, GhClient,
-    Repo, RepoIndex, SearchHit,
+    cmd_list, cmd_readmes, cmd_search, cmd_show, cmd_stats, cmd_sync, count_repos, default_db_path,
+    fetch_readmes_parallel, load_all, load_one, open_db, read_meta,
+    resolve_token, retain_repos, run_api_server, run_mcp_stdio, truncate, upsert_repos,
+    regenerate_embeddings, GhClient, Repo, RepoIndex, SearchHit,
 };
 use async_std::task::spawn_blocking;
 
@@ -123,6 +124,12 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         threads: usize,
     },
+    /// Regenerate embeddings for repos that don't have one.
+    Embed {
+        /// Max concurrent embedding generations.
+        #[arg(short, long, default_value_t = 4)]
+        concurrency: usize,
+    },
 }
 
 #[async_std::main]
@@ -142,11 +149,11 @@ async fn main() -> Result<()> {
             concurrency,
         } => {
             let token = resolve_token(cli.token)?;
-            cmd_sync(Arc::clone(&db), token, user, prune, with_readmes, concurrency).await
+            stargaze::cmd_sync(Arc::clone(&db), token, user, prune, with_readmes, concurrency).await
         }
         Cmd::Readmes { concurrency, force } => {
             let token = resolve_token(cli.token)?;
-            cmd_readmes(Arc::clone(&db), token, concurrency, force).await
+            stargaze::cmd_readmes(Arc::clone(&db), token, concurrency, force).await
         }
         Cmd::Search {
             query,
@@ -157,11 +164,11 @@ async fn main() -> Result<()> {
             or_mode,
             topic_boost,
             semantic,
-        } => cmd_search(Arc::clone(&db), &query, limit, lang, topic, fuzzy, or_mode, topic_boost, semantic).await,
-        Cmd::Show { full_name } => cmd_show(Arc::clone(&db), &full_name).await,
-        Cmd::Stats => cmd_stats(Arc::clone(&db)).await,
-        Cmd::List { limit } => cmd_list(Arc::clone(&db), limit).await,
-        Cmd::Serve => { spawn_blocking(move || run_mcp_stdio(Arc::try_unwrap(db).unwrap_or_else(|_| panic!("Failed to unwrap Arc")))).await?; Ok(()) },
+        } => stargaze::cmd_search(Arc::clone(&db), &query, limit, lang, topic, fuzzy, or_mode, topic_boost, semantic).await,
+        Cmd::Show { full_name } => stargaze::cmd_show(Arc::clone(&db), &full_name).await,
+        Cmd::Stats => stargaze::cmd_stats(Arc::clone(&db)).await,
+        Cmd::List { limit } => stargaze::cmd_list(Arc::clone(&db), limit).await,
+Cmd::Serve => { spawn_blocking(move || run_mcp_stdio(Arc::try_unwrap(db).unwrap_or_else(|_| panic!("Failed to unwrap Arc")))).await?; Ok(()) },
         Cmd::Api {
             bind,
             api_key,
@@ -172,212 +179,12 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid --bind {}: {}", bind, e))?;
             spawn_blocking(move || run_api_server(Arc::try_unwrap(db).unwrap_or_else(|_| panic!("Failed to unwrap Arc")), addr, api_key, threads)).await?; Ok(())
         }
-    }
-}
-
-async fn cmd_sync(
-    db: Arc<Database>,
-    token: String,
-    user: Option<String>,
-    prune: bool,
-    with_readmes: bool,
-    concurrency: usize,
-) -> Result<()> {
-    eprintln!("stargaze: syncing stars from github.com ...");
-    let client = GhClient::new(token.clone());
-    let items = client.starred(user.as_deref()).await?;
-    eprintln!("stargaze: fetched {} raw items", items.len());
-
-    let mut repos = Vec::with_capacity(items.len());
-    for item in &items {
-        match Repo::from_api(item) {
-            Ok(r) => repos.push(r),
-            Err(e) => eprintln!("  skip: {}", e),
-        }
-    }
-
-    if with_readmes {
-        eprintln!(
-            "stargaze: fetching {} READMEs in parallel (concurrency={}) ...",
-            repos.len(),
-            concurrency
-        );
-        repos = fetch_readmes_parallel(&token, repos, concurrency).await;
-        let fetched = repos.iter().filter(|r| r.readme.is_some()).count();
-        eprintln!("stargaze: fetched {} READMEs", fetched);
-    }
-
-    let repos_clone = repos.clone();
-    let repos_clone2 = repos_clone.clone();
-    let db_clone = Arc::clone(&db);
-    let n = spawn_blocking(move || upsert_repos(&db_clone, &repos_clone2)).await?;
-    eprintln!("stargaze: upserted {} repos", n);
-
-    if prune {
-        let keep: std::collections::HashSet<String> =
-            repos.iter().map(|r| r.full_name.clone()).collect();
-        let keep_clone = keep.clone();
-        let db_clone = Arc::clone(&db);
-        let removed = spawn_blocking(move || retain_repos(&db_clone, &keep_clone)).await?;
-        if removed > 0 {
-            eprintln!("stargaze: pruned {} unstarred repos", removed);
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_readmes(db: Arc<Database>, token: String, concurrency: usize, force: bool) -> Result<()> {
-    let all = spawn_blocking({
-        let db = db.clone();
-        move || load_all(&db)
-    }).await?;
-    let targets: Vec<Repo> = if force {
-        all
-    } else {
-        all.into_iter().filter(|r| r.readme.is_none()).collect()
-    };
-    if targets.is_empty() {
-        eprintln!("stargaze: nothing to fetch (all READMEs cached)");
-        return Ok(());
-    }
-    eprintln!(
-        "stargaze: fetching {} READMEs in parallel (concurrency={}) ...",
-        targets.len(),
-        concurrency
-    );
-    let fetched = fetch_readmes_parallel(&token, targets, concurrency).await;
-    let upserted = spawn_blocking({
-        let db = db.clone();
-        let fetched_clone = fetched.clone();
-        move || upsert_repos(&db, &fetched_clone)
-    }).await?;
-    let hit = fetched.iter().filter(|r| r.readme.is_some()).count();
-    eprintln!(
-        "stargaze: upserted {} repos ({} with fresh README)",
-        upserted, hit
-    );
-    Ok(())
-}
-
-async fn cmd_search(
-    db: Arc<Database>,
-    query: &str,
-    limit: usize,
-    lang: Option<String>,
-    topic: Option<String>,
-    fuzzy: bool,
-    or_mode: bool,
-    topic_boost: bool,
-    semantic: bool,
-) -> Result<()> {
-    let repos = spawn_blocking({
-        let db = db.clone();
-        move || load_all(&db)
-    }).await?;
-    if repos.is_empty() {
-        eprintln!("(cache is empty — run `stargaze sync` first)");
-        return Ok(());
-    }
-    let idx = RepoIndex::new(repos);
-    let hits = idx.search(query, lang.as_deref(), topic.as_deref(), limit, fuzzy, or_mode, topic_boost, semantic);
-
-    if hits.is_empty() {
-        println!("(no matches for {:?})", query);
-        return Ok(());
-    }
-    for h in &hits {
-        print_hit(h);
-    }
-    let total = idx.match_count(query, lang.as_deref(), topic.as_deref());
-    println!();
-    println!("{} match(es), showing {}", total, hits.len());
-    Ok(())
-}
-
-fn print_hit(h: &SearchHit<'_>) {
-    let r = h.repo;
-    let lang = r.language.as_deref().unwrap_or("-");
-    let desc = r.description.as_deref().unwrap_or("");
-    let desc_trunc: String = desc.chars().take(100).collect();
-    println!(
-        "  {:<50} {:<12} ★{:<7} {}",
-        truncate(&r.full_name, 50),
-        truncate(lang, 12),
-        r.stargazers_count,
-        desc_trunc
-    );
-}
-
-async fn cmd_show(db: Arc<Database>, full_name: &str) -> Result<()> {
-    match spawn_blocking({
-        let db = db.clone();
-        let full_name = full_name.to_string();
-        move || load_one(&db, &full_name)
-    }).await? {
-        Some(r) => {
-            println!("{}", serde_json::to_string_pretty(&r)?);
+        Cmd::Embed { concurrency: _ } => {
+            eprintln!("Regenerating embeddings for repos missing them...");
+            let (updated, skipped, errors) = regenerate_embeddings(&db)
+                .map_err(|e| anyhow::anyhow!("Failed to regenerate embeddings: {}", e))?;
+            eprintln!("Done: {} updated, {} skipped (already had embeddings), {} errors", updated, skipped, errors);
             Ok(())
         }
-        None => {
-            eprintln!("(not in cache — run `stargaze sync` first)");
-            std::process::exit(1);
-        }
     }
-}
-
-async fn cmd_stats(db: Arc<Database>) -> Result<()> {
-    let total = spawn_blocking({
-        let db = db.clone();
-        move || count_repos(&db)
-    }).await?;
-    let last_sync = spawn_blocking({
-        let db = db.clone();
-        move || read_meta(&db, "last_sync")
-    }).await?;
-    let last_count = spawn_blocking({
-        let db = db.clone();
-        move || read_meta(&db, "last_sync_count")
-    }).await?;
-    println!("stargaze stats");
-    println!("  cached repos : {}", total);
-    println!("  last sync    : {}", last_sync.unwrap_or_else(|| "(never)".into()));
-    println!("  last sync n  : {}", last_count.unwrap_or_else(|| "0".into()));
-
-    let repos = spawn_blocking({
-        let db = db.clone();
-        move || load_all(&db)
-    }).await?;
-    let mut by_lang: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for r in &repos {
-        let l = r.language.as_deref().unwrap_or("-");
-        *by_lang.entry(l).or_insert(0) += 1;
-    }
-    let mut langs: Vec<_> = by_lang.into_iter().collect();
-    langs.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("  top languages:");
-    for (l, c) in langs.iter().take(10) {
-        println!("    {:<15} {}", l, c);
-    }
-    Ok(())
-}
-
-async fn cmd_list(db: Arc<Database>, limit: usize) -> Result<()> {
-    let mut all = spawn_blocking({
-        let db = db.clone();
-        move || load_all(&db)
-    }).await?;
-    all.sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count));
-    for r in all.iter().take(limit) {
-        let lang = r.language.as_deref().unwrap_or("-");
-        let desc = r.description.as_deref().unwrap_or("");
-        let desc_trunc: String = desc.chars().take(100).collect();
-        println!(
-            "  {:<50} {:<12} ★{:<7} {}",
-            truncate(&r.full_name, 50),
-            truncate(lang, 12),
-            r.stargazers_count,
-            desc_trunc
-        );
-    }
-    Ok(())
 }

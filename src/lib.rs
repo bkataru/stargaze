@@ -17,6 +17,7 @@ use fuzzy_matcher::FuzzyMatcher;
 //     artifact with no runtime dependencies beyond libc.
 
 use anyhow::{anyhow, bail, Context, Result};
+use async_std::task::spawn_blocking;
 use chrono::{DateTime, Utc};
 use lru::LruCache;
 use rayon::prelude::*;
@@ -362,7 +363,6 @@ fn generate_embedding(repo: &Repo) -> anyhow::Result<Vec<f32>> {
     if embeddings.is_empty() {
         return Err(anyhow::anyhow!("No embedding generated"));
     }
-    
     Ok(embeddings[0].clone())
 }
 
@@ -895,6 +895,42 @@ pub fn upsert_repos(db: &Database, repos: &[Repo]) -> Result<usize> {
     }
     txn.commit()?;
     Ok(n)
+}
+
+/// Regenerate embeddings for all repos that don't have one.
+/// Returns (updated_count, skipped_count, error_count).
+pub fn regenerate_embeddings(db: &Database) -> Result<(usize, usize, usize)> {
+    // Load all repos
+    let repos = load_all(db)?;
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+    
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(REPOS)?;
+        for mut repo in repos {
+            if repo.embedding.is_some() {
+                skipped += 1;
+                continue;
+            }
+            match generate_embedding(&repo) {
+                Ok(emb) => {
+                    repo.embedding = Some(emb);
+                    let buf = serde_json::to_vec(&repo)?;
+                    table.insert(repo.full_name.as_str(), buf.as_slice())?;
+                    updated += 1;
+                    eprintln!("Generated embedding for {}", repo.full_name);
+                }
+                Err(e) => {
+                    eprintln!("Failed to generate embedding for {}: {}", repo.full_name, e);
+                    errors += 1;
+                }
+            }
+        }
+    }
+    txn.commit()?;
+    Ok((updated, skipped, errors))
 }
 
 /// Read every cached repo. Returns an empty vec if the table doesn't exist yet.
@@ -2395,4 +2431,715 @@ mod tests {
             }
         }
     }
+
+    mod coverage_tests {
+        use super::*;
+        use chrono::Utc;
+        use std::collections::HashSet;
+        use tempfile::TempDir;
+
+        // Helper to create a test repo
+        fn test_repo(name: &str, stars: u64) -> Repo {
+            Repo {
+                name: name.split('/').nth(1).unwrap_or("").to_string(),
+                full_name: name.to_string(),
+                owner: name.split('/').next().unwrap_or("").to_string(),
+                description: Some(format!("desc of {}", name)),
+                url: format!("https://github.com/{}", name),
+                language: Some("Rust".into()),
+                stargazers_count: stars,
+                forks_count: 0,
+                open_issues_count: 0,
+                topics: vec!["rust".to_string()],
+                default_branch: Some("main".into()),
+                license: Some("MIT".into()),
+                archived: false,
+                fork: false,
+                pushed_at: None,
+                created_at: None,
+                updated_at: None,
+                starred_at: None,
+                cached_at: Utc::now(),
+                readme: None,
+                readme_fetched_at: None,
+                embedding: None,
+            }
+        }
+
+        #[test]
+        fn test_cosine_similarity_identical() {
+            let a = vec![1.0, 0.0, 0.0];
+            let b = vec![1.0, 0.0, 0.0];
+            let sim = cosine_similarity(&a, &b);
+            assert!((sim - 1.0).abs() < 1e-6, "Identical vectors should have similarity 1.0, got {}", sim);
+        }
+
+        #[test]
+        fn test_cosine_similarity_orthogonal() {
+            let a = vec![1.0, 0.0, 0.0];
+            let b = vec![0.0, 1.0, 0.0];
+            let sim = cosine_similarity(&a, &b);
+            assert!(sim.abs() < 1e-6, "Orthogonal vectors should have similarity 0.0, got {}", sim);
+        }
+
+        #[test]
+        fn test_cosine_similarity_opposite() {
+            let a = vec![1.0, 0.0, 0.0];
+            let b = vec![-1.0, 0.0, 0.0];
+            let sim = cosine_similarity(&a, &b);
+            assert!((sim - (-1.0)).abs() < 1e-6, "Opposite vectors should have similarity -1.0, got {}", sim);
+        }
+
+        #[test]
+        fn test_cosine_similarity_empty() {
+            let a: Vec<f32> = vec![];
+            let b: Vec<f32> = vec![];
+            let sim = cosine_similarity(&a, &b);
+            assert_eq!(sim, 0.0, "Empty vectors should return 0.0");
+        }
+
+        #[test]
+        fn test_cosine_similarity_different_lengths() {
+            let a = vec![1.0, 0.0];
+            let b = vec![1.0, 0.0, 0.0];
+            let sim = cosine_similarity(&a, &b);
+            assert_eq!(sim, 0.0, "Different length vectors should return 0.0");
+        }
+
+        #[test]
+        fn test_cosine_similarity_zero_norm() {
+            let a = vec![0.0, 0.0, 0.0];
+            let b = vec![1.0, 0.0, 0.0];
+            let sim = cosine_similarity(&a, &b);
+            assert_eq!(sim, 0.0, "Zero norm vector should return 0.0");
+        }
+
+        #[test]
+        fn test_calculate_semantic_boost_exact_match() {
+            let repo = Repo {
+                name: "tensorflow".to_string(),
+                full_name: "tensorflow/tensorflow".to_string(),
+                description: Some("Machine Learning Framework".to_string()),
+                topics: vec!["machine-learning".to_string(), "tensorflow".to_string()],
+                language: Some("C++".to_string()),
+                owner: "tensorflow".to_string(),
+                url: "https://github.com/tensorflow/tensorflow".to_string(),
+                stargazers_count: 0,
+                forks_count: 0,
+                open_issues_count: 0,
+                default_branch: None,
+                license: None,
+                archived: false,
+                fork: false,
+                pushed_at: None,
+                created_at: None,
+                updated_at: None,
+                starred_at: None,
+                cached_at: chrono::Utc::now(),
+                readme: None,
+                readme_fetched_at: None,
+                embedding: None,
+            };
+            let boost = calculate_semantic_boost("tensorflow", &repo);
+            assert!(boost > 0.0, "Should have positive boost for name match");
+            assert!(boost > 3.0, "Expected boost > 3.0, got {}", boost);
+        }
+
+        #[test]
+        fn test_calculate_semantic_boost_no_match() {
+            let repo = Repo {
+                name: "rust".to_string(),
+                full_name: "rust-lang/rust".to_string(),
+                description: Some("Language".to_string()),
+                topics: vec!["systems".to_string()],
+                language: Some("Rust".to_string()),
+                owner: "rust-lang".to_string(),
+                url: "https://github.com/rust-lang/rust".to_string(),
+                stargazers_count: 0,
+                forks_count: 0,
+                open_issues_count: 0,
+                default_branch: None,
+                license: None,
+                archived: false,
+                fork: false,
+                pushed_at: None,
+                created_at: None,
+                updated_at: None,
+                starred_at: None,
+                cached_at: chrono::Utc::now(),
+                readme: None,
+                readme_fetched_at: None,
+                embedding: None,
+            };
+            let boost = calculate_semantic_boost("python", &repo);
+            assert_eq!(boost, 0.0, "No match should return 0.0");
+        }
+
+        #[test]
+        fn test_calculate_semantic_boost_description_match() {
+            let repo = super::Repo {
+                name: "ml-tool".to_string(),
+                full_name: "user/ml-tool".to_string(),
+                description: Some("A machine learning tool".to_string()),
+                topics: vec![],
+                language: None,
+                owner: "user".to_string(),
+                url: "https://github.com/user/ml-tool".to_string(),
+                stargazers_count: 0,
+                forks_count: 0,
+                open_issues_count: 0,
+                default_branch: None,
+                license: None,
+                archived: false,
+                fork: false,
+                pushed_at: None,
+                created_at: None,
+                updated_at: None,
+                starred_at: None,
+                cached_at: chrono::Utc::now(),
+                readme: None,
+                readme_fetched_at: None,
+                embedding: None,
+            };
+            let boost = super::calculate_semantic_boost("machine learning", &repo);
+            assert!(boost > 0.0, "Description match should give positive boost");
+        }
+
+        #[test]
+        fn test_calculate_semantic_boost_language_match() {
+            let repo = super::Repo {
+                name: "my-repo".to_string(),
+                full_name: "user/my-repo".to_string(),
+                description: None,
+                topics: vec![],
+                language: Some("Rust".to_string()),
+                owner: "user".to_string(),
+                url: "https://github.com/user/my-repo".to_string(),
+                stargazers_count: 0,
+                forks_count: 0,
+                open_issues_count: 0,
+                default_branch: None,
+                license: None,
+                archived: false,
+                fork: false,
+                pushed_at: None,
+                created_at: None,
+                updated_at: None,
+                starred_at: None,
+                cached_at: chrono::Utc::now(),
+                readme: None,
+                readme_fetched_at: None,
+                embedding: None,
+            };
+            let boost = super::calculate_semantic_boost("rust", &repo);
+            assert!(boost > 0.0, "Language match should give positive boost");
+        }
+
+        #[test]
+        fn test_indexed_repo_matches_empty_query() {
+            let repo = make_repo("test/test", Some("Rust"), 100, None, vec![]);
+            let idx = RepoIndex::new(vec![repo]);
+            let results = idx.search("", None, None, 10, false, false, false, false);
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn test_indexed_repo_matches() {
+            let repo = make_repo("rust-lang/rust", Some("Rust"), 100000, Some("Systems programming"), vec!["systems"]);
+            let idx = RepoIndex::new(vec![repo]);
+            let results = idx.search("rust", None, None, 10, false, false, false, false);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].repo.full_name, "rust-lang/rust");
+        }
+
+        #[test]
+        fn test_indexed_repo_no_matches() {
+            let repo = make_repo("rust-lang/rust", Some("Rust"), 100000, None, vec![]);
+            let idx = RepoIndex::new(vec![repo]);
+            let results = idx.search("nonexistent", None, None, 10, false, false, false, false);
+            assert_eq!(results.len(), 0);
+        }
+
+        #[test]
+        fn test_indexed_repo_matches_case_insensitive() {
+            let repo = make_repo("RUST-lang/rust", Some("RUST"), 100000, None, vec![]);
+            let idx = RepoIndex::new(vec![repo]);
+            let results = idx.search("rust", None, None, 10, false, false, false, false);
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn test_indexed_repo_language_filter() {
+            let repos = vec![
+                make_repo("rust/rust", Some("Rust"), 100000, None, vec![]),
+                make_repo("python/cpython", Some("Python"), 50000, None, vec![]),
+            ];
+            let idx = RepoIndex::new(repos);
+            let results = idx.search("", Some("Rust"), None, 10, false, false, false, false);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].repo.language, Some("Rust".to_string()));
+        }
+
+        #[test]
+        fn test_indexed_repo_semantic_search() {
+            let repos = vec![
+                make_repo("tensorflow/tensorflow", Some("C++"), 100000, Some("Machine learning"), vec!["ml"]),
+                make_repo("rust-lang/rust", Some("Rust"), 50000, Some("Systems programming"), vec![]),
+            ];
+            let idx = RepoIndex::new(repos);
+            let results = idx.search("machine learning", None, None, 10, false, false, false, true);
+            assert!(!results.is_empty());
+        }
+
+        #[test]
+        fn test_indexed_repo_fuzzy_search() {
+            let repos = vec![
+                make_repo("supabase/supabase", Some("TypeScript"), 100000, Some("Open source Firebase alternative"), vec![]),
+            ];
+            let idx = RepoIndex::new(repos);
+            let results = idx.search("supabase", None, None, 10, true, false, false, false);
+            assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn test_truncate_shorter() {
+            let result = super::truncate("hello", 10);
+            assert_eq!(result, "hello");
+        }
+
+        #[test]
+        fn test_truncate_exact() {
+            let result = super::truncate("hello", 5);
+            assert_eq!(result, "hello");
+        }
+
+        #[test]
+        fn test_truncate_multibyte() {
+            let result = super::truncate("café", 3);
+            assert_eq!(result, "ca…");
+        }
+
+        #[test]
+        fn test_index_is_empty() {
+            let idx = RepoIndex::new(vec![]);
+            assert!(idx.is_empty());
+            assert_eq!(idx.len(), 0);
+        }
+
+        #[test]
+        fn test_index_iter() {
+            let repos = vec![
+                make_repo("a/a", None, 1, None, vec![]),
+                make_repo("b/b", None, 2, None, vec![]),
+            ];
+            let idx = RepoIndex::new(repos);
+            assert_eq!(idx.iter().count(), 2);
+        }
+
+        fn test_indexed_repo_score_zero_no_match() {
+            let repo = make_repo("test/test", Some("Rust"), 100, None, vec![]);
+            let idx = RepoIndex::new(vec![repo]);
+            let results = idx.repos[0].score("nonexistent");
+            assert_eq!(results, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_cmd_search_semantic() {
+        use std::sync::Arc;
+        let (_idx, _dir, db) = mcp_test_index();
+        let db = Arc::new(db);
+        // Use async-std runtime
+        let result = async_std::task::block_on(super::cmd_search(
+            Arc::clone(&db),
+            "postgres",
+            10,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cmd_search_with_semantic() {
+        use std::sync::Arc;
+        let (_idx, _dir, db) = mcp_test_index();
+        let db = Arc::new(db);
+        let result = async_std::task::block_on(super::cmd_search(
+            Arc::clone(&db),
+            "machine",
+            10,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cmd_show_existing() {
+        use std::sync::Arc;
+        let (_idx, _dir, db) = mcp_test_index();
+        let db = Arc::new(db);
+        let result = async_std::task::block_on(super::cmd_show(Arc::clone(&db), "supabase/supabase"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cmd_show_missing() {
+        use std::sync::Arc;
+        let (_idx, _dir, db) = mcp_test_index();
+        let db = Arc::new(db);
+        // This should exit with code 1 (via std::process::exit), not return normally
+        // Instead, we test that load_one returns None (which cmd_show handles)
+        use super::load_one;
+        let result = async_std::task::block_on(async {
+            let loaded = spawn_blocking(move || load_one(&db, "nonexistent/repo")).await;
+            loaded.unwrap()
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_cmd_stats() {
+        use std::sync::Arc;
+        let (_idx, _dir, db) = mcp_test_index();
+        let db = Arc::new(db);
+        let result = async_std::task::block_on(super::cmd_stats(Arc::clone(&db)));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cmd_list() {
+        use std::sync::Arc;
+        let (_idx, _dir, db) = mcp_test_index();
+        let db = Arc::new(db);
+        let result = async_std::task::block_on(super::cmd_list(Arc::clone(&db), 5));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_link_next_basic() {
+        let link = r#"<https://api.github.com/repositories?page=2>; rel="next", <https://api.github.com/repositories?page=3>; rel="last""#;
+        let next = super::parse_link_next(link);
+        assert_eq!(next, Some("https://api.github.com/repositories?page=2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_link_next_no_next() {
+        let link = r#"<https://api.github.com/repositories?page=3>; rel="last""#;
+        let next = super::parse_link_next(link);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_parse_link_next_empty() {
+        let link = "";
+        let next = super::parse_link_next(link);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_resolve_token_flag_wins() {
+        let result = super::resolve_token(Some("my_token".to_string()));
+        assert_eq!(result.unwrap(), "my_token");
+    }
+
+    #[test]
+    fn test_resolve_token_empty_flag_falls_through() {
+        // Set up env var
+        std::env::set_var("GH_TOKEN", "env_token");
+        let result = super::resolve_token(Some("".to_string()));
+        std::env::remove_var("GH_TOKEN");
+        assert_eq!(result.unwrap(), "env_token");
+    }
+
+    #[test]
+    fn test_resolve_token_missing_errors() {
+        // Unset both env vars
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("GITHUB_TOKEN");
+        let result = super::resolve_token(None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("gh auth token"));
+    }
+
+    #[test]
+    fn test_calculate_semantic_boost_full_name_match() {
+        let repo = super::Repo {
+            name: "my-repo".to_string(),
+            full_name: "user/my-repo".to_string(),
+            description: None,
+            topics: vec![],
+            language: None,
+            owner: "user".to_string(),
+            url: "https://github.com/user/my-repo".to_string(),
+            stargazers_count: 0,
+            forks_count: 0,
+            open_issues_count: 0,
+            default_branch: None,
+            license: None,
+            archived: false,
+            fork: false,
+            pushed_at: None,
+            created_at: None,
+            updated_at: None,
+            starred_at: None,
+            cached_at: chrono::Utc::now(),
+            readme: None,
+            readme_fetched_at: None,
+            embedding: None,
+        };
+        let boost = super::calculate_semantic_boost("my-repo", &repo);
+        // Should match full_name (weight 1.5) and name (weight 1.5)
+        assert!(boost >= 1.5);
+    }
+
+    #[test]
+    fn test_calculate_semantic_boost_topic_match() {
+        let repo = super::Repo {
+            name: "tool".to_string(),
+            full_name: "user/tool".to_string(),
+            description: None,
+            topics: vec!["rust".to_string(), "cli".to_string()],
+            language: None,
+            owner: "user".to_string(),
+            url: "https://github.com/user/tool".to_string(),
+            stargazers_count: 0,
+            forks_count: 0,
+            open_issues_count: 0,
+            default_branch: None,
+            license: None,
+            archived: false,
+            fork: false,
+            pushed_at: None,
+            created_at: None,
+            updated_at: None,
+            starred_at: None,
+            cached_at: chrono::Utc::now(),
+            readme: None,
+            readme_fetched_at: None,
+            embedding: None,
+        };
+        let boost = super::calculate_semantic_boost("rust", &repo);
+        // Should match topic (weight 0.8) and language would match too (1.0) - but language is None
+        assert!(boost >= 0.8);
+    }
+}
+
+// Public command handlers for CLI commands
+// These are here so they can be tested directly
+
+pub async fn cmd_sync(
+    db: Arc<Database>,
+    token: String,
+    user: Option<String>,
+    prune: bool,
+    with_readmes: bool,
+    concurrency: usize,
+) -> Result<()> {
+    eprintln!("stargaze: syncing stars from github.com ...");
+    let client = GhClient::new(token.clone());
+    let items = client.starred(user.as_deref()).await?;
+    eprintln!("stargaze: fetched {} raw items", items.len());
+
+    let mut repos = Vec::with_capacity(items.len());
+    for item in &items {
+        match Repo::from_api(item) {
+            Ok(r) => repos.push(r),
+            Err(e) => eprintln!("  skip: {}", e),
+        }
+    }
+
+    if with_readmes {
+        eprintln!(
+            "stargaze: fetching {} READMEs in parallel (concurrency={}) ...",
+            repos.len(),
+            concurrency
+        );
+        repos = fetch_readmes_parallel(&token, repos, concurrency).await;
+        let fetched = repos.iter().filter(|r| r.readme.is_some()).count();
+        eprintln!("stargaze: fetched {} READMEs", fetched);
+    }
+
+    let repos_clone = repos.clone();
+    let repos_clone2 = repos_clone.clone();
+    let db_clone = Arc::clone(&db);
+    let n = spawn_blocking(move || upsert_repos(&db_clone, &repos_clone2)).await?;
+    eprintln!("stargaze: upserted {} repos", n);
+
+    if prune {
+        let keep: std::collections::HashSet<String> =
+            repos.iter().map(|r| r.full_name.clone()).collect();
+        let keep_clone = keep.clone();
+        let db_clone = Arc::clone(&db);
+        let removed = spawn_blocking(move || retain_repos(&db_clone, &keep_clone)).await?;
+        if removed > 0 {
+            eprintln!("stargaze: pruned {} unstarred repos", removed);
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_readmes(db: Arc<Database>, token: String, concurrency: usize, force: bool) -> Result<()> {
+    let all: Vec<Repo> = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await?;
+    let targets: Vec<Repo> = if force {
+        all
+    } else {
+        all.into_iter().filter(|r| r.readme.is_none()).collect()
+    };
+    if targets.is_empty() {
+        eprintln!("stargaze: nothing to fetch (all READMEs cached)");
+        return Ok(());
+    }
+    eprintln!(
+        "stargaze: fetching {} READMEs in parallel (concurrency={}) ...",
+        targets.len(),
+        concurrency
+    );
+    let fetched = fetch_readmes_parallel(&token, targets, concurrency).await;
+    let upserted = spawn_blocking({
+        let db = db.clone();
+        let fetched_clone = fetched.clone();
+        move || upsert_repos(&db, &fetched_clone)
+    }).await?;
+    let hit = fetched.iter().filter(|r| r.readme.is_some()).count();
+    eprintln!(
+        "stargaze: upserted {} repos ({} with fresh README)",
+        upserted, hit
+    );
+    Ok(())
+}
+
+pub async fn cmd_search(
+    db: Arc<Database>,
+    query: &str,
+    limit: usize,
+    lang: Option<String>,
+    topic: Option<String>,
+    fuzzy: bool,
+    or_mode: bool,
+    topic_boost: bool,
+    semantic: bool,
+) -> Result<()> {
+    let repos: Vec<Repo> = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await?;
+    if repos.is_empty() {
+        eprintln!("(cache is empty — run `stargaze sync` first)");
+        return Ok(());
+    }
+    let idx = RepoIndex::new(repos);
+    let hits = idx.search(query, lang.as_deref(), topic.as_deref(), limit, fuzzy, or_mode, topic_boost, semantic);
+
+    if hits.is_empty() {
+        println!("(no matches for {:?})", query);
+        return Ok(());
+    }
+    for h in &hits {
+        print_hit(h);
+    }
+    let total = idx.match_count(query, lang.as_deref(), topic.as_deref());
+    println!();
+    println!("{} match(es), showing {}", total, hits.len());
+    Ok(())
+}
+
+fn print_hit(h: &SearchHit<'_>) {
+    let r = h.repo;
+    let lang = r.language.as_deref().unwrap_or("-");
+    let desc = r.description.as_deref().unwrap_or("");
+    let desc_trunc: String = desc.chars().take(100).collect();
+    println!(
+        "  {:<50} {:<12} ★{:<7} {}",
+        truncate(&r.full_name, 50),
+        truncate(lang, 12),
+        r.stargazers_count,
+        desc_trunc
+    );
+}
+
+pub async fn cmd_show(db: Arc<Database>, full_name: &str) -> Result<()> {
+    match spawn_blocking({
+        let db = db.clone();
+        let full_name = full_name.to_string();
+        move || load_one(&db, &full_name)
+    }).await? {
+        Some(r) => {
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            Ok(())
+        }
+        None => {
+            eprintln!("(not in cache — run `stargaze sync` first)");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn cmd_stats(db: Arc<Database>) -> Result<()> {
+    let total: u64 = spawn_blocking({
+        let db = db.clone();
+        move || count_repos(&db).map(|n| n as u64)
+    }).await?;
+    let last_sync: Option<String> = spawn_blocking({
+        let db = db.clone();
+        move || read_meta(&db, "last_sync")
+    }).await?;
+    let last_count: Option<String> = spawn_blocking({
+        let db = db.clone();
+        move || read_meta(&db, "last_sync_count")
+    }).await?;
+    println!("stargaze stats");
+    println!("  cached repos : {}", total);
+    println!("  last sync    : {}", last_sync.unwrap_or_else(|| "(never)".into()));
+    println!("  last sync n  : {}", last_count.unwrap_or_else(|| "0".into()));
+
+    let repos: Vec<Repo> = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await?;
+    let mut by_lang: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for r in &repos {
+        let l = r.language.as_deref().unwrap_or("-");
+        *by_lang.entry(l).or_insert(0) += 1;
+    }
+    let mut langs: Vec<_> = by_lang.into_iter().collect();
+    langs.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("  top languages:");
+    for (l, c) in langs.iter().take(10) {
+        println!("    {:<15} {}", l, c);
+    }
+    Ok(())
+}
+
+pub async fn cmd_list(db: Arc<Database>, limit: usize) -> Result<()> {
+    let mut all: Vec<Repo> = spawn_blocking({
+        let db = db.clone();
+        move || load_all(&db)
+    }).await?;
+    all.sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count));
+    for r in all.iter().take(limit) {
+        let lang = r.language.as_deref().unwrap_or("-");
+        let desc = r.description.as_deref().unwrap_or("");
+        let desc_trunc: String = desc.chars().take(100).collect();
+        println!(
+            "  {:<50} {:<12} ★{:<7} {}",
+            truncate(&r.full_name, 50),
+            truncate(lang, 12),
+            r.stargazers_count,
+            desc_trunc
+        );
+    }
+    Ok(())
 }
