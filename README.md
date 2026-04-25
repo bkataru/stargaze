@@ -263,7 +263,7 @@ Full breakdown:
 
 | Layer | File | Count |
 |---|---|---|
-|| Unit — parsing / index / MCP / API / coverage | `src/lib.rs` | `parse_link_next`, `Repo::from_api`, `IndexedRepo`, `score`, `truncate`, `resolve_token`, MCP handlers, HTTP router, query-string parser, semantic embedding tests (14 coverage_tests) (~82 tests) |
+| Unit — parsing / index / MCP / API / coverage | `src/lib.rs` | `parse_link_next`, `Repo::from_api`, `IndexedRepo`, `score`, `truncate`, `resolve_token`, MCP handlers, HTTP router, query-string parser, semantic embedding tests (14 coverage_tests) (~82 tests) |
 | Integration — redb | `tests/store.rs` | upsert / load / meta / retain / idempotency / regenerate_embeddings (13 tests) |
 | Integration — search | `tests/search.rs` | filters / ranking / cache / large corpora (14 tests) |
 | Integration — parse | `tests/parse.rs` | edge-case payloads + Link headers (9 tests) |
@@ -302,9 +302,9 @@ The short version: `stargaze` is local-first, CI-tested, and runs anywhere Rust 
 
 ## Roadmap
 
-|- **v0.3.0** (current): Semantic search with `fastembed` local embeddings + cosine similarity, sync, parallel README fetch, substring search with weighted scoring, LRU cache, MCP stdio server, HTTP JSON API server, 102 tests, coverage_tests, criterion benches, GH Actions CI + release workflow.
-|- **v0.4**: `stargaze diff --since DATE` — delta of additions/removals (already schema-ready via `starred_at`).
-|- **v0.5**: fuzzy matching with `fuzzy-matcher`, OR mode search (foo OR bar), topic boost multipliers, export formats (markdown, opml, csv), `stargaze categorize` heuristic grouping, `stargaze open <name>` launcher.
+- **v0.3.0** (current): Semantic search with `fastembed` local embeddings + cosine similarity, sync, parallel README fetch, substring search with weighted scoring, LRU cache, MCP stdio server, HTTP JSON API server, 102 tests, coverage_tests, criterion benches, GH Actions CI + release workflow.
+- **v0.4**: `stargaze diff --since DATE` — delta of additions/removals (already schema-ready via `starred_at`).
+- **v0.5**: fuzzy matching with `fuzzy-matcher`, OR mode search (foo OR bar), topic boost multipliers, export formats (markdown, opml, csv), `stargaze categorize` heuristic grouping, `stargaze open <name>` launcher.
 
 ## License
 
